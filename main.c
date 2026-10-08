@@ -83,6 +83,54 @@ static chat_mreza_handle_t chat_konekcija = NULL;
      }
  }
  
+/* Kopira 'izvor' u 'odrediste' i usput eskejpuje specijalne JSON karaktere.
+ * Vraća broj upisanih bajtova. */
+static size_t json_escape(char *odrediste, size_t max_velicina, const char *izvor)
+{
+    size_t i = 0;
+    while (*izvor != '\0' && i < max_velicina - 1) {
+        switch (*izvor) {
+            case '"':
+                if (i + 2 < max_velicina) {
+                    odrediste[i++] = '\\';
+                    odrediste[i++] = '"';
+                }
+                break;
+            case '\\':
+                if (i + 2 < max_velicina) {
+                    odrediste[i++] = '\\';
+                    odrediste[i++] = '\\';
+                }
+                break;
+            case '\n':
+                if (i + 2 < max_velicina) {
+                    odrediste[i++] = '\\';
+                    odrediste[i++] = 'n';
+                }
+                break;
+            case '\t':
+                if (i + 2 < max_velicina) {
+                    odrediste[i++] = '\\';
+                    odrediste[i++] = 't';
+                }
+                break;
+            case '\r':
+                if (i + 2 < max_velicina) {
+                    odrediste[i++] = '\\';
+                    odrediste[i++] = 'r';
+                }
+                break;
+            default:
+                // Svi ostali karakteri (uključujući ? i :) se prepisuju normalno
+                odrediste[i++] = *izvor;
+                break;
+        }
+        izvor++;
+    }
+    odrediste[i] = '\0';
+    return i;
+}
+
 /* Izvlači tekst iz Groq JSON odgovora.
  * Traži "content":"..." i kopira sadržaj u 'izlaz'.
  * Vraća EOK ako je uspelo, ENOENT ako nije našao.
@@ -92,32 +140,41 @@ static errno_t izvuci_odgovor(const char *http_odgovor, char *izlaz, size_t max)
     if (http_odgovor == NULL || izlaz == NULL || max == 0)
         return EINVAL;
 
-    /* 1. Nađi početak JSON body-ja (posle \r\n\r\n) */
+    /* 1. Nađi početak JSON tela (iza \r\n\r\n) */
     const char *body = strstr(http_odgovor, "\r\n\r\n");
     if (body == NULL)
         return ENOENT;
-    body += 4;  /* preskoči \r\n\r\n */
+    body += 4;
 
-    /* 2. Nađi "content":" u body-ju */
-    const char *p = strstr(body, "\"content\":\"");
+    /* 2. Prvo lociramo gde počinje tekst poruke asistenta u nizovima ("message")
+         kako bismo preskočili sistemske metapodatke i korisnički upit */
+    const char *poruka_sekcija = strstr(body, "\"message\"");
+    if (poruka_sekcija == NULL) {
+        // Ako nema "message", probaj sa "choices" (standardni OpenAI/Groq format)
+        poruka_sekcija = strstr(body, "\"choices\"");
+    }
+    
+    if (poruka_sekcija == NULL)
+        poruka_sekcija = body; // Fallback na celo telo ako ne nađe specifične ključeve
+
+    /* 3. Tražimo tačan "content":" unutar bezbedne zone */
+    const char *p = strstr(poruka_sekcija, "\"content\":\"");
     if (p == NULL)
         return ENOENT;
-    p += 11;  /* preskoči "content":" */
+    p += 11;
 
-    /* 3. Kopiraj do zatvarajućeg " — ali pazi na escape sekvence */
+    /* 4. Kopiranje i bezbedno unescape-ovanje */
     size_t i = 0;
     while (*p != '\0' && *p != '"' && i < max - 1) {
         if (*p == '\\' && *(p + 1) != '\0') {
-            /* Escape sekvence: \n, \t, \", \\, itd. */
             p++;
             switch (*p) {
-            case 'n': izlaz[i++] = '\n'; break;
-            case 't': izlaz[i++] = '\t'; break;
-            case 'r': izlaz[i++] = '\r'; break;
-            case '"': izlaz[i++] = '"';  break;
-            case '\\': izlaz[i++] = '\\'; break;
-            case '/': izlaz[i++] = '/';  break;
-            default:  izlaz[i++] = *p;   break;
+                case 'n': izlaz[i++] = '\n'; break;
+                case 't': izlaz[i++] = '\t'; break;
+                case 'r': izlaz[i++] = '\r'; break;
+                case '"': izlaz[i++] = '"';  break;
+                case '\\': izlaz[i++] = '\\'; break;
+                default:  izlaz[i++] = *p;   break;
             }
         } else {
             izlaz[i++] = *p;
@@ -128,6 +185,7 @@ static errno_t izvuci_odgovor(const char *http_odgovor, char *izlaz, size_t max)
 
     return (i > 0) ? EOK : ENOENT;
 }
+
  
 
  // Pomoćna funkcija koja dodaje isključivo jedan red teksta u sistemske labele
@@ -165,55 +223,56 @@ static errno_t izvuci_odgovor(const char *http_odgovor, char *izlaz, size_t max)
  
  // Glavna funkcija: Autor u svom redu, tekst ispod izlomljen na 44 karaktera
  void dodaj_poruku_u_bitmape(chat_app_t *c, const char *autor, const char *tekst)
- {
-     if (c == NULL || autor == NULL || tekst == NULL) {
-         return;
-     }
- 
-     // POPRAVKA: Definišemo "red_autora" kao pravi fiksni niz karaktera na steku!
-     char red_autora[MAX_DUZINA_LINIJE];
-     snprintf(red_autora, sizeof(red_autora), "[%s]", autor);
-     push_jedan_red_u_labele(c, red_autora);
- 
-     // Prelamamo sam tekst poruke nezavisno od autora
-     char *ptr = (char *)tekst;
-     char bafer_reda[MAX_DUZINA_LINIJE];
-     int maksimalna_sirina_linije = 44; 
- 
-     while (*ptr != '\0') {
-         int len = str_length(ptr);
- 
-         if (len <= maksimalna_sirina_linije) {
-             push_jedan_red_u_labele(c, ptr);
-             break;
-         }
- 
-         int prelom = maksimalna_sirina_linije;
-         while (prelom > 0 && ptr[prelom] != ' ' && ptr[prelom] != '\0') {
-             prelom--;
-         }
- 
-         if (prelom == 0) {
-             prelom = maksimalna_sirina_linije;
-         }
- 
-         str_ncpy(bafer_reda, sizeof(bafer_reda), ptr, prelom);
-         bafer_reda[prelom] = '\0';
- 
-         push_jedan_red_u_labele(c, bafer_reda);
- 
-         ptr += prelom;
-         
-         if (*ptr == ' ') {
-             ptr++;
-         }
-     }
- 
-     // Bezbedno osvežavamo prozor
-     if (c->window != NULL) {
-         (void) ui_window_paint(c->window);
-     }
- }
+{
+    if (c == NULL || autor == NULL || tekst == NULL) {
+        return;
+    }
+
+    char red_autora[MAX_DUZINA_LINIJE];
+    snprintf(red_autora, sizeof(red_autora), "[%s]", autor);
+    push_jedan_red_u_labele(c, red_autora);
+
+    char *ptr = (char *)tekst;
+    char bafer_reda[MAX_DUZINA_LINIJE];
+    int maksimalna_sirina_linije = 44; 
+
+    while (*ptr != '\0') {
+        int len = str_length(ptr);
+
+        if (len <= maksimalna_sirina_linije) {
+            push_jedan_red_u_labele(c, ptr);
+            break;
+        }
+
+        // Tražimo poslednji razmak unutar dozvoljene širine
+        int prelom = maksimalna_sirina_linije;
+        while (prelom > 0 && ptr[prelom] != ' ' && ptr[prelom] != '\0') {
+            prelom--;
+        }
+
+        // POPRAVKA: Ako nema razmaka (reč je predugačka), nasilno je prelamamo na 44. karakteru
+        if (prelom == 0) {
+            prelom = maksimalna_sirina_linije;
+        }
+
+        str_ncpy(bafer_reda, sizeof(bafer_reda), ptr, prelom);
+        bafer_reda[prelom] = '\0';
+
+        push_jedan_red_u_labele(c, bafer_reda);
+
+        ptr += prelom;
+        
+        // Preskoči razmak na početku sledećeg reda ako smo na njega naišli
+        if (*ptr == ' ') {
+            ptr++;
+        }
+    }
+
+    if (c->window != NULL) {
+        (void) ui_window_paint(c->window);
+    }
+}
+
 
  
  // Akcija kada se klikne na dugme "Posalji"
@@ -278,6 +337,23 @@ static errno_t izvuci_odgovor(const char *http_odgovor, char *izlaz, size_t max)
 		memset(json_payload, 0, 2048);
 		memset(http_zahtev, 0, 4096);
 		memset(prijemni_bafer, 0, 8192);
+
+
+        // Alociramo dodatni bafer za eskejpiovanu poruku
+        char *eskejpiovana_poruka = malloc(2048);
+        if (!eskejpiovana_poruka) {
+            dodaj_poruku_u_bitmape(&chat, "Sistem", "Greska: Van memorije za eskejping.");
+            if (json_payload) free(json_payload);
+            if (http_zahtev) free(http_zahtev);
+            if (prijemni_bafer) free(prijemni_bafer);
+            chat_oslobodi_https(chat_konekcija);
+            chat_konekcija = NULL;
+            return;
+        }
+
+        // Eskejpujemo poruku pre pakovanja u JSON
+        json_escape(eskejpiovana_poruka, 2048, moja_poruka);
+
 
 		// 2. ★ Koristimo KOPIJU (moja_poruka), NE tekst_unosa ★
 		snprintf(json_payload, 2048,
@@ -355,6 +431,7 @@ snprintf(http_zahtev, 4096,
 		free(json_payload);
 		free(http_zahtev);
 		free(prijemni_bafer);
+        free(eskejpiovana_poruka); 
 
 		chat_oslobodi_https(chat_konekcija);
 		chat_konekcija = NULL;
