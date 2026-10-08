@@ -359,7 +359,7 @@ static errno_t izvuci_odgovor(const char *http_odgovor, char *izlaz, size_t max)
 		snprintf(json_payload, 2048,
             "{\"model\":\"openai/gpt-oss-120b\","
             "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
-            moja_poruka);
+            eskejpiovana_poruka);
 
 
 		// Dijagnostika — obriši kad proradi
