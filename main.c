@@ -26,10 +26,10 @@
  #include "main.h"
  #include "chat_mreza.h"
 
- 
+ static char GEMINI_API_KEY[128] = "";
  static chat_app_t chat;
  // Kreiramo globalnu instancu mrežne strukture
-#define GEMINI_API_KEY "AIzaSyB38W3tqqjA-Z60x3z-5UfjUyVoSROA0WI"
+
 static chat_mreza_handle_t chat_konekcija = NULL;
  static ui_entry_t *input_entry; // Ostaje samo donji unos za tastaturu
  
@@ -83,6 +83,52 @@ static chat_mreza_handle_t chat_konekcija = NULL;
      }
  }
  
+/* Izvlači tekst iz Groq JSON odgovora.
+ * Traži "content":"..." i kopira sadržaj u 'izlaz'.
+ * Vraća EOK ako je uspelo, ENOENT ako nije našao.
+ */
+static errno_t izvuci_odgovor(const char *http_odgovor, char *izlaz, size_t max)
+{
+    if (http_odgovor == NULL || izlaz == NULL || max == 0)
+        return EINVAL;
+
+    /* 1. Nađi početak JSON body-ja (posle \r\n\r\n) */
+    const char *body = strstr(http_odgovor, "\r\n\r\n");
+    if (body == NULL)
+        return ENOENT;
+    body += 4;  /* preskoči \r\n\r\n */
+
+    /* 2. Nađi "content":" u body-ju */
+    const char *p = strstr(body, "\"content\":\"");
+    if (p == NULL)
+        return ENOENT;
+    p += 11;  /* preskoči "content":" */
+
+    /* 3. Kopiraj do zatvarajućeg " — ali pazi na escape sekvence */
+    size_t i = 0;
+    while (*p != '\0' && *p != '"' && i < max - 1) {
+        if (*p == '\\' && *(p + 1) != '\0') {
+            /* Escape sekvence: \n, \t, \", \\, itd. */
+            p++;
+            switch (*p) {
+            case 'n': izlaz[i++] = '\n'; break;
+            case 't': izlaz[i++] = '\t'; break;
+            case 'r': izlaz[i++] = '\r'; break;
+            case '"': izlaz[i++] = '"';  break;
+            case '\\': izlaz[i++] = '\\'; break;
+            case '/': izlaz[i++] = '/';  break;
+            default:  izlaz[i++] = *p;   break;
+            }
+        } else {
+            izlaz[i++] = *p;
+        }
+        p++;
+    }
+    izlaz[i] = '\0';
+
+    return (i > 0) ? EOK : ENOENT;
+}
+ 
 
  // Pomoćna funkcija koja dodaje isključivo jedan red teksta u sistemske labele
  static void push_jedan_red_u_labele(chat_app_t *c, const char *ceo_red)
@@ -114,6 +160,8 @@ static chat_mreza_handle_t chat_konekcija = NULL;
          }
      }
  }
+
+
  
  // Glavna funkcija: Autor u svom redu, tekst ispod izlomljen na 44 karaktera
  void dodaj_poruku_u_bitmape(chat_app_t *c, const char *autor, const char *tekst)
@@ -166,6 +214,7 @@ static chat_mreza_handle_t chat_konekcija = NULL;
          (void) ui_window_paint(c->window);
      }
  }
+
  
  // Akcija kada se klikne na dugme "Posalji"
  static void chat_posalji_clicked(ui_pbutton_t *pbutton, void *arg)
@@ -179,25 +228,39 @@ static chat_mreza_handle_t chat_konekcija = NULL;
 	
 	const char *tekst_unosa = ui_entry_get_text(input_entry);
 	
-	if (tekst_unosa != NULL && str_cmp(tekst_unosa, "") != 0) {
-		dodaj_poruku_u_bitmape(&chat, "Ti", tekst_unosa);
+	if (tekst_unosa != NULL && tekst_unosa[0] != '\0') {
+		// ★★★ POPRAVKA: Kopiramo tekst PRE brisanja entry-ja ★★★
+		// ui_entry_get_text vraća interni pointer. Ako obrišemo entry,
+		// tekst_unosa pokazuje na prazan string. Zato pravimo kopiju.
+		char moja_poruka[1024];
+		str_ncpy(moja_poruka, sizeof(moja_poruka), tekst_unosa, sizeof(moja_poruka) - 1);
+		moja_poruka[sizeof(moja_poruka) - 1] = '\0';
+
+		dodaj_poruku_u_bitmape(&chat, "Ti", moja_poruka);
 		
 		(void) ui_entry_set_text(input_entry, (void *) "");
 		ui_entry_paint(input_entry);
 
 		dodaj_poruku_u_bitmape(&chat, "Sistem", "Povezujem se na Google...");
 
+		// Defanzivno: očisti prethodnu konekciju ako postoji
+		if (chat_konekcija != NULL) {
+			chat_oslobodi_https(chat_konekcija);
+			chat_konekcija = NULL;
+		}
+
 		// Otvaramo bezbednu HTTPS vezu preko stabilnog Pauk mrežnog sloja
 		errno_t rc = chat_otvori_https_vezu(GEMINI_HOST, GEMINI_PORT, &chat_konekcija);
 		if (rc != EOK) {
+			chat_konekcija = NULL;
 			char greska_poruka[128];
 			snprintf(greska_poruka, sizeof(greska_poruka), "Mrezna greska! Kod: %d", rc);
 			dodaj_poruku_u_bitmape(&chat, "Sistem", greska_poruka);
 			return;
 		}
 
-		// POPRAVKA: Dinamički alociramo bafere na hipu umesto na steku dretve!
-        char *json_payload = malloc(2048);
+		// Dinamički alociramo bafere na hipu umesto na steku dretve
+		char *json_payload = malloc(2048);
 		char *http_zahtev = malloc(4096);
 		char *prijemni_bafer = malloc(8192);
 
@@ -211,26 +274,33 @@ static chat_mreza_handle_t chat_konekcija = NULL;
 			return;
 		}
 
-      // 1. Čistimo bafere na nulu pre svakog upisa (Sinhronizovano)
-	// 1. Čistimo bafere na nulu pre svakog upisa (Sinhronizovano)
-    memset(json_payload, 0, 2048);
-    memset(http_zahtev, 0, 4096);
-    memset(prijemni_bafer, 0, 8192); // POPRAVLJENO: Sada je tačno ime promenljive!
+		// 1. Čistimo bafere na nulu pre svakog upisa
+		memset(json_payload, 0, 2048);
+		memset(http_zahtev, 0, 4096);
+		memset(prijemni_bafer, 0, 8192);
 
-    // 2. Čist i standardan snprintf na jednoj liniji
-    snprintf(json_payload, 2048, "{\"contents\":[{\"parts\":[{\"text\":\"%s\"}]}]}", tekst_unosa);
+		// 2. ★ Koristimo KOPIJU (moja_poruka), NE tekst_unosa ★
+		snprintf(json_payload, 2048,
+            "{\"model\":\"openai/gpt-oss-120b\","
+            "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
+            moja_poruka);
 
-    int payload_len = (int)strlen(json_payload);
 
-    // 3. Formiramo HTTP POST zahtev sa preciznom dužinom sadržaja
-    snprintf(http_zahtev, 4096,
-             "POST /v1beta/models/gemini-3.5-flash:generateContent?key=%s HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "Content-Type: application/json\r\n"
-             "Content-Length: %d\r\n"
-             "Connection: close\r\n\r\n"
-             "%s",
-             GEMINI_API_KEY, GEMINI_HOST, payload_len, json_payload);
+		// Dijagnostika — obriši kad proradi
+		printf("[DEBUG] JSON payload: %s\n", json_payload);
+
+		int payload_len = (int)strlen(json_payload);
+
+		// 3. Formiramo HTTP POST zahtev sa preciznom dužinom sadržaja
+snprintf(http_zahtev, 4096,
+         "POST /openai/v1/chat/completions HTTP/1.1\r\n"
+         "Host: %s\r\n"
+         "Authorization: Bearer %s\r\n"
+         "Content-Type: application/json\r\n"
+         "Content-Length: %d\r\n"
+         "Connection: close\r\n\r\n"
+         "%s",
+         GEMINI_HOST, GEMINI_API_KEY, payload_len, json_payload);
 
 		dodaj_poruku_u_bitmape(&chat, "Sistem", "Saljem upit...");
 
@@ -244,22 +314,39 @@ static chat_mreza_handle_t chat_konekcija = NULL;
 
 		dodaj_poruku_u_bitmape(&chat, "Sistem", "Cekam odgovor...");
 
-		memset(prijemni_bafer, 0, 4096);
+		/* Skupljaj SVE pakete dok server ne zatvori vezu (Connection: close) */
+		memset(prijemni_bafer, 0, 8192);
+		size_t ukupno = 0;
 		size_t procitano = 0;
-		int pokusaji_citanja = 0;
-		
-		while (pokusaji_citanja < 50) {
-			rc = chat_primi_https(chat_konekcija, prijemni_bafer, 4096, &procitano);
+		int praznih = 0;
+
+		while (praznih < 200 && ukupno < 8192 - 1) {
+			rc = chat_primi_https(chat_konekcija,
+			                      prijemni_bafer + ukupno,
+			                      8192 - 1 - ukupno,
+			                      &procitano);
 			if (rc == EOK && procitano > 0) {
-				break;
+				ukupno += procitano;
+				praznih = 0;          /* resetuj — ima napretka */
+			} else if (rc != EOK) {
+				break;                /* prava greška ili EOF */
+			} else {
+				praznih++;
+				fibril_usleep(10000); /* 10ms pauza */
 			}
-			fibril_usleep(10000);
-			pokusaji_citanja++;
 		}
-		
-		if (procitano > 0) {
-			// USPEH: Prikazujemo sirovi odgovor na bitmapama labela!
-			dodaj_poruku_u_bitmape(&chat, "Sistem", prijemni_bafer);
+
+		printf("[DEBUG] ukupno procitano: %zu bajta\n", ukupno);
+
+		if (ukupno > 0) {
+			prijemni_bafer[ukupno] = '\0';
+			char odgovor[4096];
+			errno_t frc = izvuci_odgovor(prijemni_bafer, odgovor, sizeof(odgovor));
+			if (frc == EOK) {
+				dodaj_poruku_u_bitmape(&chat, "AI", odgovor);
+			} else {
+				dodaj_poruku_u_bitmape(&chat, "AI", prijemni_bafer);
+			}
 		} else {
 			dodaj_poruku_u_bitmape(&chat, "Sistem", "Server je zatvorio vezu ili je doslo do greske.");
 		}
@@ -300,6 +387,33 @@ void chat_file_exit(ui_menu_entry_t *mentry, void *arg)
      ui_entry_paint(input_entry);
      free(str);
  }
+
+ static errno_t ucitaj_api_kljuc(void)
+{
+    FILE *f = fopen("keys.txt", "r");
+    if (!f) {
+        printf("[CHAT] Ne mogu da otvorim keys.txt\n");
+        return ENOENT;
+    }
+    
+    if (fgets(GEMINI_API_KEY, sizeof(GEMINI_API_KEY), f) == NULL) {
+        fclose(f);
+        return EIO;
+    }
+    fclose(f);
+    
+    /* Ukloni \n na kraju ako postoji */
+    size_t len = strlen(GEMINI_API_KEY);
+    while (len > 0 && (GEMINI_API_KEY[len - 1] == '\n' ||
+                       GEMINI_API_KEY[len - 1] == '\r')) {
+        GEMINI_API_KEY[--len] = '\0';
+    }
+    
+    return EOK;
+}
+
+
+
  
  int main(int argc, char *argv[])
  {
@@ -420,6 +534,11 @@ void chat_file_exit(ui_menu_entry_t *mentry, void *arg)
          printf("Neuspelo bojanje prozora.\n");
          return rc;
      }
+
+     if (ucitaj_api_kljuc() != EOK) {
+        printf("Greska: nema API kljuca. Stavite ga u keys.txt\n");
+        return 1;
+    }
  
      ui_run(ui);
      ui_window_destroy(window);

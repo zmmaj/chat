@@ -51,3 +51,4 @@ typedef struct {
 void chat_file_exit(ui_menu_entry_t *mentry, void *arg);
 void dodaj_u_istoriju(const char *format, const char *autor, const char *tekst);
 void dodaj_poruku_u_bitmape(chat_app_t *c, const char *autor, const char *tekst);
+//errno_t izvuci_odgovor(const char *http_odgovor, char *izlaz, size_t max);

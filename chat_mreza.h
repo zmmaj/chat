@@ -19,10 +19,11 @@
  #include <mbedtls/x509_crt.h>
  
  #undef GEMINI_HOST
- #define GEMINI_HOST "generativelanguage.googleapis.com"
+ #define GEMINI_HOST "api.groq.com"
  #define GEMINI_PORT 443
  // Struktura preuzeta direktno iz Pauk arhitekture
  typedef struct {
+    tcp_t *tcp_service;
      tcp_conn_t *tcp_conn;
      mbedtls_ssl_context ssl;
      mbedtls_ssl_config conf;

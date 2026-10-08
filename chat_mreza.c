@@ -50,12 +50,16 @@ static int tls_send_cb(void *ctx, const unsigned char *buf, size_t len)
 // Low-level mbedTLS callback za prijem iz HelenOS TCP
 static int tls_recv_cb(void *ctx, unsigned char *buf, size_t len)
 {
-	pauk_tls_connection_t *conn = (pauk_tls_connection_t *)ctx;
-	size_t nread = 0;
-	errno_t rc = tcp_conn_recv(conn->tcp_conn, (char *)buf, len, &nread);
-	if (rc == EOK && nread > 0) return (int)nread;
-	if (rc == EAGAIN || (rc == EOK && nread == 0)) return MBEDTLS_ERR_SSL_WANT_READ;
-	return MBEDTLS_ERR_NET_RECV_FAILED;
+    pauk_tls_connection_t *conn = (pauk_tls_connection_t *)ctx;
+    size_t nread = 0;
+    errno_t rc = tcp_conn_recv(conn->tcp_conn, (char *)buf, len, &nread);
+
+    if (rc == EOK && nread > 0)
+        return (int)nread;
+    if (rc == EAGAIN)
+        return MBEDTLS_ERR_SSL_WANT_READ;
+    /* EOK + nread==0  =>  peer je zatvorio vezu  =>  GREŠKA */
+    return MBEDTLS_ERR_NET_RECV_FAILED;
 }
 
 
@@ -130,8 +134,13 @@ printf("chat_otvori_https_vezu-0\n");
     printf("chat_otvori_https_vezu-3\n");
 	// --- 2. Pauk TLS Alokacija i Inicijalizacija ---
 	pauk_tls_connection_t *conn = calloc(1, sizeof(*conn));
-	if (!conn) return ENOMEM;
+	if (!conn) {
+		tcp_conn_destroy(tcp_veza);
+		tcp_destroy(tcp_service);
+		return ENOMEM;
+	}
 
+	conn->tcp_service = tcp_service;
 	conn->tcp_conn = tcp_veza;
 	
 	mbedtls_ssl_init(&conn->ssl);
@@ -203,6 +212,11 @@ printf("chat_otvori_https_vezu-0\n");
 	return EOK;
 
 fail:
+if (conn->tcp_conn != NULL)
+tcp_conn_destroy(conn->tcp_conn);
+if (tcp_service != NULL)
+tcp_destroy(tcp_service);
+
 	mbedtls_x509_crt_free(&conn->ca_cert);
 	mbedtls_entropy_free(&conn->entropy);
 	mbedtls_ctr_drbg_free(&conn->ctr_drbg);
@@ -215,23 +229,31 @@ fail:
 // Slanje podataka preko TLS-a
 errno_t chat_posalji_https(chat_mreza_handle_t tls_conn, const void *data, size_t len)
 {
-	pauk_tls_connection_t *conn = (pauk_tls_connection_t *)tls_conn;
-	size_t remaining = len;
-	const unsigned char *ptr = (const unsigned char *)data;
-	
-	while (remaining > 0) {
-		int ret = mbedtls_ssl_write(&conn->ssl, ptr, remaining);
-		if (ret > 0) {
-			ptr += ret;
-			remaining -= ret;
-		} else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-			fibril_usleep(10000);
-			continue;
-		} else {
-			return EIO;
-		}
-	}
-	return EOK;
+    pauk_tls_connection_t *conn = (pauk_tls_connection_t *)tls_conn;
+    const unsigned char *ptr = (const unsigned char *)data;
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        /* Ograniči svaki mbedtls_ssl_write na 512 bajta.
+         * Manji chunk-ovi = manja šansa da se nešto zaglavi. */
+        size_t chunk = remaining;
+        if (chunk > 512)
+            chunk = 512;
+
+        int ret = mbedtls_ssl_write(&conn->ssl, ptr, chunk);
+        if (ret > 0) {
+            ptr += ret;
+            remaining -= ret;
+            /* Kratka pauza posle svakog chunk-a — daj TCP-u vremena */
+            fibril_usleep(1000);   /* 1ms */
+        } else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            fibril_usleep(10000);  /* 10ms — bafer pun, čekaj */
+            continue;
+        } else {
+            return EIO;
+        }
+    }
+    return EOK;
 }
 
 // Prijem podataka preko TLS-a
@@ -254,12 +276,28 @@ errno_t chat_primi_https(chat_mreza_handle_t tls_conn, void *buffer, size_t size
 // Čišćenje resursa
 void chat_oslobodi_https(chat_mreza_handle_t tls_conn)
 {
-	if (!tls_conn) return;
-	pauk_tls_connection_t *conn = (pauk_tls_connection_t *)tls_conn;
-	mbedtls_x509_crt_free(&conn->ca_cert);
-	mbedtls_entropy_free(&conn->entropy);
-	mbedtls_ctr_drbg_free(&conn->ctr_drbg);
-	mbedtls_ssl_config_free(&conn->conf);
-	mbedtls_ssl_free(&conn->ssl);
-	free(conn);
+    if (!tls_conn) return;
+    pauk_tls_connection_t *conn = (pauk_tls_connection_t *)tls_conn;
+
+    /* 1. TLS close_notify (best-effort, ignoriši grešku) */
+    if (conn->tcp_conn != NULL)
+        (void) mbedtls_ssl_close_notify(&conn->ssl);
+
+    /* 2. Uništi TCP konekciju — OVO JE KLJUČNO */
+    if (conn->tcp_conn != NULL) {
+        tcp_conn_destroy(conn->tcp_conn);
+        conn->tcp_conn = NULL;
+    }
+
+	if (conn->tcp_service != NULL) {
+		tcp_destroy(conn->tcp_service);
+		conn->tcp_service = NULL;
+	}
+
+    mbedtls_x509_crt_free(&conn->ca_cert);
+    mbedtls_entropy_free(&conn->entropy);
+    mbedtls_ctr_drbg_free(&conn->ctr_drbg);
+    mbedtls_ssl_config_free(&conn->conf);
+    mbedtls_ssl_free(&conn->ssl);
+    free(conn);
 }

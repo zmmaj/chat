@@ -28,3 +28,6 @@
 
 deps = [ 'http','inet', 'uri', 'posix','mbedtls', 'ui', 'gfx' ]
 src = files('main.c', 'chat_mreza.c')
+
+
+installed_data += { 'name': 'keys.txt', 'dir': '/' }
